@@ -1,0 +1,10 @@
+{
+    "name": "wcs/affiliate-agents",
+    "description": "Tests for WCS Affiliate Agents",
+    "require-dev": {
+        "phpunit/phpunit": "^9"
+    },
+    "autoload": {
+        "classmap": ["."]
+    }
+}
