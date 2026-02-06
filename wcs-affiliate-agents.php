@@ -1035,18 +1035,15 @@ $export_url = wp_nonce_url(
                 if ($is_new) {
                     $uid = $this->generate_unique_uid();
 
-                    // Fix: Generate dummy email if missing
                     if ($email === '') {
-                         $email = 'affiliate_' . strtolower($uid) . '@' . parse_url(home_url(), PHP_URL_HOST);
+                        $host = parse_url(home_url(), PHP_URL_HOST);
+                        if (!$host) {
+                            $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'example.com';
+                        }
+                        $email = 'affiliate_' . strtolower($uid) . '@' . $host;
                     }
 
                     $user_id = $this->ensure_user_for_affiliate($email, $name);
-
-                    // Fix: If user creation failed, we can still proceed with NULL user_id if desired,
-                    // but ensure_user_for_affiliate returns 0 on failure.
-                    // Let's explicitly check if 0 and set to NULL for database if needed,
-                    // but DB schema allows NULL. 0 is not NULL.
-                    // However, we'll keep 0 if that's what WP uses for "no user".
 
                     $inserted = $wpdb->insert(
                         $this->affiliates_table,
