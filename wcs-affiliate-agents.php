@@ -1019,7 +1019,8 @@ $export_url = wp_nonce_url(
             $bank_account_type = sanitize_text_field($_POST['bank_account_type'] ?? '');
             $bank_account_number = sanitize_text_field($_POST['bank_account_number'] ?? '');
             $commission = isset($_POST['commission_percent']) ? floatval($_POST['commission_percent']) : 0;
-            $status = in_array($_POST['status'] ?? 'active', ['active','inactive'], true) ? $_POST['status'] : 'active';
+            $status_input = $_POST['status'] ?? 'active';
+            $status = in_array($status_input, ['active','inactive'], true) ? $status_input : 'active';
             $dashboard_mode = $_POST['dashboard_mode'] ?? 'default';
             if (!in_array($dashboard_mode, ['default','simple','advanced'], true)) {
                 $dashboard_mode = 'default';
@@ -1033,7 +1034,19 @@ $export_url = wp_nonce_url(
 
                 if ($is_new) {
                     $uid = $this->generate_unique_uid();
+
+                    // Fix: Generate dummy email if missing
+                    if ($email === '') {
+                         $email = 'affiliate_' . strtolower($uid) . '@' . parse_url(home_url(), PHP_URL_HOST);
+                    }
+
                     $user_id = $this->ensure_user_for_affiliate($email, $name);
+
+                    // Fix: If user creation failed, we can still proceed with NULL user_id if desired,
+                    // but ensure_user_for_affiliate returns 0 on failure.
+                    // Let's explicitly check if 0 and set to NULL for database if needed,
+                    // but DB schema allows NULL. 0 is not NULL.
+                    // However, we'll keep 0 if that's what WP uses for "no user".
 
                     $inserted = $wpdb->insert(
                         $this->affiliates_table,
@@ -1108,6 +1121,8 @@ $export_url = wp_nonce_url(
 
         $title = $is_new ? __('Add New Affiliate', 'wcs-affiliates') : __('Edit Affiliate', 'wcs-affiliates');
         $back_url = add_query_arg(['page' => 'wcs_affiliates'], admin_url('admin.php'));
+
+        $row = $row ?? []; // Ensure row is array-ish if null
 
         $uid = $row['uid'] ?? $this->generate_preview_uid();
         $ref_url = $this->build_referral_url($uid);
