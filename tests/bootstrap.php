@@ -46,7 +46,7 @@ function apply_filters($tag, $value, ...$args) {
 
 function add_shortcode($tag, $func) {}
 
-function is_admin() { return false; }
+function is_admin() { return isset($GLOBALS['is_admin']) ? $GLOBALS['is_admin'] : false; }
 // headers_sent is built-in
 function is_ssl() { return false; }
 function home_url($path = '') { return 'http://example.com' . $path; }
@@ -188,6 +188,9 @@ function wp_nonce_field() {}
 function wp_nonce_url($url) { return $url; }
 function wp_die($msg = '', $title = '', $args = []) {
     throw new Exception("WP_DIE: " . $msg);
+}
+function wp_redirect($location, $status = 302) {
+    throw new Exception("WP_REDIRECT: " . $location);
 }
 
 // WooCommerce Mocks
