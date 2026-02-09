@@ -49,6 +49,7 @@ class WCS_Affiliate_Agents {
         // Admin UI
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
+        add_action('admin_init', [$this, 'handle_admin_actions']);
 
         // AJAX: download QR
         add_action('wp_ajax_wcs_download_affiliate_qr', [$this, 'ajax_download_affiliate_qr']);
@@ -469,6 +470,69 @@ public function admin_menu() {
         );
     }
 
+    public function handle_admin_actions() {
+        if (!is_admin() || !isset($_GET['page']) || $_GET['page'] !== 'wcs_affiliates') {
+            return;
+        }
+        $action = isset($_GET['action']) ? sanitize_key($_GET['action']) : '';
+        if (!$action) {
+            return;
+        }
+
+        if ($action === 'delete_agent') {
+            $this->handle_delete_agent();
+        }
+        if ($action === 'clear_commissions') {
+            $this->handle_clear_commissions();
+        }
+    }
+
+    private function handle_delete_agent() {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die('Unauthorized', 403);
+        }
+        $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+        check_admin_referer('wcs_aff_delete_' . $id);
+
+        global $wpdb;
+        // Delete commissions
+        $wpdb->delete($this->commissions_table, ['affiliate_id' => $id], ['%d']);
+        // Delete affiliate
+        $wpdb->delete($this->affiliates_table, ['id' => $id], ['%d']);
+
+        wp_redirect(add_query_arg(['page' => 'wcs_affiliates', 'msg' => 'deleted'], admin_url('admin.php')));
+        exit;
+    }
+
+    private function handle_clear_commissions() {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die('Unauthorized', 403);
+        }
+        $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+        check_admin_referer('wcs_aff_clear_' . $id);
+
+        global $wpdb;
+        $wpdb->delete($this->commissions_table, ['affiliate_id' => $id], ['%d']);
+
+        // Redirect back to edit page or list page?
+        // User asked for option on Edit and List page.
+        // If referred from list, go to list. If from edit, go to edit.
+        // For simplicity, let's assume we redirect to edit page if we are "clearing",
+        // or we can just redirect to list if the parameter isn't present.
+        // Actually, let's redirect to the list if the action came from there?
+        // But commonly, "Clear Commissions" keeps the agent, so staying on the edit page (if that's where we were) is nice.
+        // I'll check wp_get_referer() or just redirect to the list with a message for now to be safe and consistent.
+        // OR better: check if we have a 'from' arg or just default to list.
+
+        $redirect = add_query_arg(['page' => 'wcs_affiliates', 'msg' => 'cleared'], admin_url('admin.php'));
+        if (isset($_GET['ref']) && $_GET['ref'] === 'edit') {
+             $redirect = add_query_arg(['page' => 'wcs_affiliates', 'action' => 'edit', 'id' => $id, 'msg' => 'cleared'], admin_url('admin.php'));
+        }
+
+        wp_redirect($redirect);
+        exit;
+    }
+
     public function register_settings() {
         register_setting(self::OPTION_KEY, self::OPTION_KEY, [$this, 'sanitize_options']);
 
@@ -722,6 +786,16 @@ public function admin_menu() {
             wp_die(__('You do not have permission to access this page.', 'wcs-affiliates'));
         }
 
+        // Show notices
+        if (isset($_GET['msg'])) {
+            $m = sanitize_key($_GET['msg']);
+            if ($m === 'deleted') {
+                echo '<div class="notice notice-success"><p>' . esc_html__('Affiliate deleted.', 'wcs-affiliates') . '</p></div>';
+            } elseif ($m === 'cleared') {
+                echo '<div class="notice notice-success"><p>' . esc_html__('Commissions cleared.', 'wcs-affiliates') . '</p></div>';
+            }
+        }
+
         $action = isset($_GET['action']) ? sanitize_key($_GET['action']) : '';
         if ($action === 'edit' || $action === 'new') {
             $this->render_affiliate_edit_page();
@@ -951,6 +1025,20 @@ $export_url = wp_nonce_url(
                             ),
                             'wcs_download_affiliate_qr_' . $aff_id
                         );
+                        $delete_url = wp_nonce_url(
+                            add_query_arg(
+                                ['page' => 'wcs_affiliates', 'action' => 'delete_agent', 'id' => $aff_id],
+                                admin_url('admin.php')
+                            ),
+                            'wcs_aff_delete_' . $aff_id
+                        );
+                        $clear_url = wp_nonce_url(
+                            add_query_arg(
+                                ['page' => 'wcs_affiliates', 'action' => 'clear_commissions', 'id' => $aff_id],
+                                admin_url('admin.php')
+                            ),
+                            'wcs_aff_clear_' . $aff_id
+                        );
                         ?>
                         <tr>
                             <td><input type="checkbox" name="affiliate_ids[]" value="<?php echo esc_attr($aff_id); ?>" /></td>
@@ -965,7 +1053,11 @@ $export_url = wp_nonce_url(
                             <td><?php echo $payout_ready ? '✅' : '⚠️'; ?></td>
                             <td><?php echo esc_html(ucfirst($row['status'])); ?></td>
                             <td><a href="<?php echo esc_url($qr_url); ?>" class="button button-small"><?php esc_html_e('Download QR', 'wcs-affiliates'); ?></a></td>
-                            <td><a href="<?php echo esc_url($edit_url); ?>"><?php esc_html_e('Edit', 'wcs-affiliates'); ?></a></td>
+                            <td>
+                                <a href="<?php echo esc_url($edit_url); ?>"><?php esc_html_e('Edit', 'wcs-affiliates'); ?></a>
+                                | <a href="#" onclick="wcs_confirm_delete('<?php echo esc_js($clear_url); ?>', '<?php echo esc_js(__('Clear all commissions for this agent?', 'wcs-affiliates')); ?>'); return false;" style="color:orange;"><?php esc_html_e('Clear', 'wcs-affiliates'); ?></a>
+                                | <a href="#" onclick="wcs_confirm_delete('<?php echo esc_js($delete_url); ?>', '<?php echo esc_js(__('Delete this agent completely?', 'wcs-affiliates')); ?>'); return false;" style="color:red;"><?php esc_html_e('Delete', 'wcs-affiliates'); ?></a>
+                            </td>
                         </tr>
                     <?php endforeach; ?>
                 <?php endif; ?>
@@ -973,6 +1065,12 @@ $export_url = wp_nonce_url(
             </table>
             </form>
             <script>
+            function wcs_confirm_delete(url, msg) {
+                var check = prompt(msg + "\n<?php echo esc_js(__('Type "delete" to confirm:', 'wcs-affiliates')); ?>");
+                if (check === 'delete') {
+                    window.location.href = url;
+                }
+            }
             (function(){
                 var all = document.getElementById('wcs_aff_select_all');
                 if (!all) return;
@@ -1128,6 +1226,8 @@ $export_url = wp_nonce_url(
         $dashboard_mode_val = $row['dashboard_mode'] ?? 'default';
 
         $qr_url = '';
+        $delete_url = '';
+        $clear_url = '';
         if (!$is_new && !empty($row['id'])) {
             $qr_url = wp_nonce_url(
                 add_query_arg(
@@ -1135,6 +1235,20 @@ $export_url = wp_nonce_url(
                     admin_url('admin-ajax.php')
                 ),
                 'wcs_download_affiliate_qr_' . (int) $row['id']
+            );
+            $delete_url = wp_nonce_url(
+                add_query_arg(
+                    ['page' => 'wcs_affiliates', 'action' => 'delete_agent', 'id' => (int) $row['id']],
+                    admin_url('admin.php')
+                ),
+                'wcs_aff_delete_' . (int) $row['id']
+            );
+            $clear_url = wp_nonce_url(
+                add_query_arg(
+                    ['page' => 'wcs_affiliates', 'action' => 'clear_commissions', 'id' => (int) $row['id'], 'ref' => 'edit'],
+                    admin_url('admin.php')
+                ),
+                'wcs_aff_clear_' . (int) $row['id']
             );
         }
         ?>
@@ -1230,6 +1344,23 @@ $export_url = wp_nonce_url(
                     <button type="submit" name="wcs_aff_save" class="button button-primary"><?php esc_html_e('Save Affiliate', 'wcs-affiliates'); ?></button>
                 </p>
             </form>
+
+            <?php if (!$is_new && $delete_url) : ?>
+            <hr style="margin: 30px 0;">
+            <h2><?php esc_html_e('Danger Zone', 'wcs-affiliates'); ?></h2>
+            <p>
+                <button type="button" class="button" onclick="wcs_confirm_delete('<?php echo esc_js($clear_url); ?>', '<?php echo esc_js(__('Clear all commissions for this agent? Agent will remain.', 'wcs-affiliates')); ?>')" style="color:orange; border-color:orange;"><?php esc_html_e('Clear Commissions', 'wcs-affiliates'); ?></button>
+                <button type="button" class="button" onclick="wcs_confirm_delete('<?php echo esc_js($delete_url); ?>', '<?php echo esc_js(__('Delete this agent completely? All data will be lost.', 'wcs-affiliates')); ?>')" style="color:red; border-color:red; margin-left:10px;"><?php esc_html_e('Delete Agent', 'wcs-affiliates'); ?></button>
+            </p>
+            <script>
+            function wcs_confirm_delete(url, msg) {
+                var check = prompt(msg + "\n<?php echo esc_js(__('Type "delete" to confirm:', 'wcs-affiliates')); ?>");
+                if (check === 'delete') {
+                    window.location.href = url;
+                }
+            }
+            </script>
+            <?php endif; ?>
         </div>
         <?php
     }
