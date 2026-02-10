@@ -50,6 +50,8 @@ class WCS_Affiliate_Agents {
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
         add_action('admin_init', [$this, 'handle_admin_actions']);
+        add_action('admin_init', [$this, 'handle_save_affiliate']);
+        add_action('admin_init', [$this, 'handle_bulk_actions']);
         add_action('admin_init', [$this, 'maybe_update_schema']);
 
         // AJAX: download QR
@@ -618,6 +620,115 @@ public function admin_menu() {
         exit;
     }
 
+    public function handle_save_affiliate() {
+        if (!is_admin() || empty($_POST['wcs_aff_save'])) {
+            return;
+        }
+        check_admin_referer('wcs_aff_edit');
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die('Unauthorized', 403);
+        }
+
+        global $wpdb;
+        $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+        $is_new = ($_GET['action'] ?? '') === 'new';
+
+        $name  = sanitize_text_field($_POST['name'] ?? '');
+        $email = sanitize_email($_POST['email'] ?? '');
+        $phone = sanitize_text_field($_POST['phone'] ?? '');
+        $nequi = sanitize_text_field($_POST['nequi_phone'] ?? '');
+        $bank_name = sanitize_text_field($_POST['bank_name'] ?? '');
+        $bank_account_type = sanitize_text_field($_POST['bank_account_type'] ?? '');
+        $bank_account_number = sanitize_text_field($_POST['bank_account_number'] ?? '');
+        $commission = isset($_POST['commission_percent']) ? floatval($_POST['commission_percent']) : 0;
+        $status_input = $_POST['status'] ?? 'active';
+        $status = in_array($status_input, ['active','inactive'], true) ? $status_input : 'active';
+        $dashboard_mode = $_POST['dashboard_mode'] ?? 'default';
+        if (!in_array($dashboard_mode, ['default','simple','advanced'], true)) {
+            $dashboard_mode = 'default';
+        }
+
+        $now = current_time('mysql');
+
+        if ($is_new) {
+            $uid = $this->generate_unique_uid();
+
+            if ($email === '') {
+                $host = parse_url(home_url(), PHP_URL_HOST);
+                if (!$host) {
+                    $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'example.com';
+                }
+                $email = 'affiliate_' . strtolower($uid) . '@' . $host;
+            }
+
+            $user_id = $this->ensure_user_for_affiliate($email, $name);
+
+            $inserted = $wpdb->insert(
+                $this->affiliates_table,
+                [
+                    'user_id'            => $user_id,
+                    'uid'                => $uid,
+                    'name'               => $name,
+                    'email'              => $email,
+                    'phone'              => $phone,
+                    'nequi_phone'        => $nequi,
+                    'bank_name'          => $bank_name,
+                    'bank_account_type'  => $bank_account_type,
+                    'bank_account_number'=> $bank_account_number,
+                    'commission_percent' => $commission,
+                    'dashboard_mode'     => $dashboard_mode,
+                    'status'             => $status,
+                    'created_at'         => $now,
+                    'updated_at'         => $now,
+                ],
+                [
+                    '%d','%s','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%s','%s',
+                ]
+            );
+
+            if ($inserted !== false) {
+                $new_id = (int) $wpdb->insert_id;
+                wp_redirect(add_query_arg(['page' => 'wcs_affiliates', 'action' => 'edit', 'id' => $new_id, 'msg' => 'saved'], admin_url('admin.php')));
+                exit;
+            } else {
+                 wp_die('Database insert failed: ' . esc_html($wpdb->last_error));
+            }
+
+        } else {
+            $row = $wpdb->get_row($wpdb->prepare("SELECT user_id FROM {$this->affiliates_table} WHERE id = %d", $id), ARRAY_A);
+            if (!$row) {
+                wp_die('Affiliate not found.');
+            }
+            $user_id = $row['user_id'];
+            if (!$user_id) {
+                $user_id = $this->ensure_user_for_affiliate($email, $name);
+            }
+            $updated = $wpdb->update(
+                $this->affiliates_table,
+                [
+                    'user_id'            => $user_id,
+                    'name'               => $name,
+                    'email'              => $email,
+                    'phone'              => $phone,
+                    'nequi_phone'        => $nequi,
+                    'bank_name'          => $bank_name,
+                    'bank_account_type'  => $bank_account_type,
+                    'bank_account_number'=> $bank_account_number,
+                    'commission_percent' => $commission,
+                    'dashboard_mode'     => $dashboard_mode,
+                    'status'             => $status,
+                    'updated_at'         => $now,
+                ],
+                ['id' => $id],
+                ['%d','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%d'],
+                ['%d']
+            );
+
+            wp_redirect(add_query_arg(['page' => 'wcs_affiliates', 'action' => 'edit', 'id' => $id, 'msg' => 'saved'], admin_url('admin.php')));
+            exit;
+        }
+    }
+
     public function register_settings() {
         register_setting(self::OPTION_KEY, self::OPTION_KEY, [$this, 'sanitize_options']);
 
@@ -1111,19 +1222,25 @@ $export_url = wp_nonce_url(
                 <button type="submit" class="button"><?php esc_html_e('Generate', 'wcs-affiliates'); ?></button>
             </form>
 
-            <form method="post" action="<?php echo esc_url(admin_url('admin-ajax.php')); ?>" style="margin:12px 0;">
-                <input type="hidden" name="action" value="wcs_download_affiliate_qr_zip" />
-                <?php wp_nonce_field('wcs_download_affiliate_qr_zip'); ?>
-                <p style="margin:0 0 10px 0;">
-                    <button type="submit" class="button" onclick="return confirm('<?php echo esc_js(__('Download QR codes for selected affiliates?', 'wcs-affiliates')); ?>');">
-                        <?php esc_html_e('Download selected QRs (ZIP)', 'wcs-affiliates'); ?>
-                    </button>
-                </p>
+            <form method="post" style="margin:12px 0;" id="wcs-aff-bulk-form">
+                <?php wp_nonce_field('wcs_aff_bulk_action'); ?>
+
+                <div class="tablenav top">
+                    <div class="alignleft actions bulkactions">
+                        <select name="bulk_action" id="bulk-action-selector-top">
+                            <option value="-1"><?php esc_html_e('Bulk actions', 'wcs-affiliates'); ?></option>
+                            <option value="delete"><?php esc_html_e('Delete', 'wcs-affiliates'); ?></option>
+                            <option value="download_qr_zip"><?php esc_html_e('Download selected QRs (ZIP)', 'wcs-affiliates'); ?></option>
+                        </select>
+                        <input type="submit" id="doaction" class="button action" value="<?php esc_attr_e('Apply', 'wcs-affiliates'); ?>">
+                    </div>
+                </div>
 
                 <table class="widefat striped">
                 <thead>
                 <tr>
                     <th style="width:40px;"><input type="checkbox" id="wcs_aff_select_all" /></th>
+                    <th style="width:50px;">#</th>
                     <th><?php esc_html_e('Name', 'wcs-affiliates'); ?></th>
                     <th><?php esc_html_e('Email', 'wcs-affiliates'); ?></th>
                     <th><?php esc_html_e('UID', 'wcs-affiliates'); ?></th>
@@ -1140,9 +1257,13 @@ $export_url = wp_nonce_url(
                 </thead>
                 <tbody>
                 <?php if (empty($rows)) : ?>
-                    <tr><td colspan="13"><?php esc_html_e('No affiliates yet.', 'wcs-affiliates'); ?></td></tr>
+                    <tr><td colspan="14"><?php esc_html_e('No affiliates yet.', 'wcs-affiliates'); ?></td></tr>
                 <?php else : ?>
-                    <?php foreach ($rows as $row) :
+                    <?php
+                    $row_index = 0;
+                    foreach ($rows as $row) :
+                        $row_index++;
+                        $current_number = $offset + $row_index;
                         $aff_id = (int) $row['id'];
                         $t = $totals[$aff_id] ?? ['unexported' => 0, 'exported' => 0, 'unpaid' => 0, 'total' => 0, 'currency' => ''];
                         $has_nequi = !empty($row['nequi_phone']);
@@ -1176,6 +1297,7 @@ $export_url = wp_nonce_url(
                         ?>
                         <tr>
                             <td><input type="checkbox" name="affiliate_ids[]" value="<?php echo esc_attr($aff_id); ?>" /></td>
+                            <td><?php echo (int) $current_number; ?></td>
                             <td><?php echo esc_html(!empty($row['name']) ? $row['name'] : '—'); ?></td>
                             <td><?php if (!empty($row['email'])) : ?><a href="mailto:<?php echo esc_attr($row['email']); ?>"><?php echo esc_html($row['email']); ?></a><?php else : ?>—<?php endif; ?></td>
                             <td><code><?php echo esc_html($row['uid']); ?></code></td>
@@ -1246,6 +1368,18 @@ $export_url = wp_nonce_url(
                     var boxes = document.querySelectorAll('input[name="affiliate_ids[]"]');
                     for (var i=0;i<boxes.length;i++){ boxes[i].checked = all.checked; }
                 });
+
+                var form = document.getElementById('wcs-aff-bulk-form');
+                if (form) {
+                    form.addEventListener('submit', function(e){
+                        var selector = document.getElementById('bulk-action-selector-top');
+                        if (selector && selector.value === 'delete') {
+                            if (!confirm('<?php echo esc_js(__('Are you sure you want to delete the selected affiliates?', 'wcs-affiliates')); ?>')) {
+                                e.preventDefault();
+                            }
+                        }
+                    });
+                }
             })();
             </script>
         </div>
@@ -1274,112 +1408,8 @@ $export_url = wp_nonce_url(
             }
         }
 
-        if (!empty($_POST['wcs_aff_save'])) {
-            check_admin_referer('wcs_aff_edit');
-
-            $name  = sanitize_text_field($_POST['name'] ?? '');
-            $email = sanitize_email($_POST['email'] ?? '');
-            $phone = sanitize_text_field($_POST['phone'] ?? '');
-            $nequi = sanitize_text_field($_POST['nequi_phone'] ?? '');
-            $bank_name = sanitize_text_field($_POST['bank_name'] ?? '');
-            $bank_account_type = sanitize_text_field($_POST['bank_account_type'] ?? '');
-            $bank_account_number = sanitize_text_field($_POST['bank_account_number'] ?? '');
-            $commission = isset($_POST['commission_percent']) ? floatval($_POST['commission_percent']) : 0;
-            $status_input = $_POST['status'] ?? 'active';
-            $status = in_array($status_input, ['active','inactive'], true) ? $status_input : 'active';
-            $dashboard_mode = $_POST['dashboard_mode'] ?? 'default';
-            if (!in_array($dashboard_mode, ['default','simple','advanced'], true)) {
-                $dashboard_mode = 'default';
-            }
-
-            if ($name === '' && $email === '') {
-                // allow generic affiliates without details
-            }
-            {
-                $now = current_time('mysql');
-
-                if ($is_new) {
-                    $uid = $this->generate_unique_uid();
-
-                    if ($email === '') {
-                        $host = parse_url(home_url(), PHP_URL_HOST);
-                        if (!$host) {
-                            $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : 'example.com';
-                        }
-                        $email = 'affiliate_' . strtolower($uid) . '@' . $host;
-                    }
-
-                    $user_id = $this->ensure_user_for_affiliate($email, $name);
-
-                    $inserted = $wpdb->insert(
-                        $this->affiliates_table,
-                        [
-                            'user_id'            => $user_id,
-                            'uid'                => $uid,
-                            'name'               => $name,
-                            'email'              => $email,
-                            'phone'              => $phone,
-                            'nequi_phone'        => $nequi,
-                            'bank_name'          => $bank_name,
-                            'bank_account_type'  => $bank_account_type,
-                            'bank_account_number'=> $bank_account_number,
-                            'commission_percent' => $commission,
-                            'dashboard_mode'     => $dashboard_mode,
-                            'status'             => $status,
-                            'created_at'         => $now,
-                            'updated_at'         => $now,
-                        ],
-                        [
-                            '%d','%s','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%s','%s',
-                        ]
-                    );
-                    $id = (int) $wpdb->insert_id;
-                    $is_new = false;
-                    $row = $wpdb->get_row(
-                        $wpdb->prepare("SELECT * FROM {$this->affiliates_table} WHERE id = %d", $id),
-                        ARRAY_A
-                    );
-                    if ($inserted === false) {
-                        echo '<div class="notice notice-error"><p>' . esc_html__('Database insert failed: ', 'wcs-affiliates') . esc_html($wpdb->last_error) . '</p></div>';
-                    } else {
-                        echo '<div class="notice notice-success"><p>Affiliate created.</p></div>';
-                    }
-                } else {
-                    $user_id = $row['user_id'];
-                    if (!$user_id) {
-                        $user_id = $this->ensure_user_for_affiliate($email, $name);
-                    }
-                    $updated = $wpdb->update(
-                        $this->affiliates_table,
-                        [
-                            'user_id'            => $user_id,
-                            'name'               => $name,
-                            'email'              => $email,
-                            'phone'              => $phone,
-                            'nequi_phone'        => $nequi,
-                            'bank_name'          => $bank_name,
-                            'bank_account_type'  => $bank_account_type,
-                            'bank_account_number'=> $bank_account_number,
-                            'commission_percent' => $commission,
-                            'dashboard_mode'     => $dashboard_mode,
-                            'status'             => $status,
-                            'updated_at'         => $now,
-                        ],
-                        ['id' => $id],
-                        ['%d','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%d'],
-                        ['%d']
-                    );
-                    $row = $wpdb->get_row(
-                        $wpdb->prepare("SELECT * FROM {$this->affiliates_table} WHERE id = %d", $id),
-                        ARRAY_A
-                    );
-                    if ($updated === false) {
-                        echo '<div class="notice notice-error"><p>' . esc_html__('Database update failed: ', 'wcs-affiliates') . esc_html($wpdb->last_error) . '</p></div>';
-                    } else {
-                        echo '<div class="notice notice-success"><p>Affiliate updated.</p></div>';
-                    }
-                }
-            }
+        if (isset($_GET['msg']) && $_GET['msg'] === 'saved') {
+            echo '<div class="notice notice-success"><p>' . esc_html__('Affiliate saved.', 'wcs-affiliates') . '</p></div>';
         }
 
         $title = $is_new ? __('Add New Affiliate', 'wcs-affiliates') : __('Edit Affiliate', 'wcs-affiliates');
@@ -1794,6 +1824,44 @@ $export_url = wp_nonce_url(
     }
 
 
+    public function handle_bulk_actions() {
+        if (!is_admin()) {
+            return;
+        }
+        if (isset($_POST['bulk_action']) && $_POST['bulk_action'] !== '-1') {
+            check_admin_referer('wcs_aff_bulk_action');
+            if (!current_user_can('manage_woocommerce')) {
+                wp_die('Unauthorized', 403);
+            }
+
+            $ids = $_POST['affiliate_ids'] ?? [];
+            if (empty($ids) || !is_array($ids)) {
+                return;
+            }
+
+            $ids = array_values(array_unique(array_map('intval', (array) $ids)));
+            $ids = array_filter($ids, function ($v) { return $v > 0; });
+            if (empty($ids)) return;
+
+            if ($_POST['bulk_action'] === 'delete') {
+                global $wpdb;
+                $placeholders = implode(',', array_fill(0, count($ids), '%d'));
+
+                // Delete commissions
+                $wpdb->query($wpdb->prepare("DELETE FROM {$this->commissions_table} WHERE affiliate_id IN ($placeholders)", ...$ids));
+
+                // Delete affiliates
+                $wpdb->query($wpdb->prepare("DELETE FROM {$this->affiliates_table} WHERE id IN ($placeholders)", ...$ids));
+
+                wp_redirect(add_query_arg(['page' => 'wcs_affiliates', 'msg' => 'deleted'], admin_url('admin.php')));
+                exit;
+
+            } elseif ($_POST['bulk_action'] === 'download_qr_zip') {
+                $this->generate_qr_zip_response($ids);
+            }
+        }
+    }
+
     public function ajax_download_affiliate_qr_zip() {
         if (!current_user_can('manage_woocommerce')) {
             wp_die('Unauthorized', 403);
@@ -1812,6 +1880,10 @@ $export_url = wp_nonce_url(
             wp_die('No affiliates selected', 400);
         }
 
+        $this->generate_qr_zip_response($ids);
+    }
+
+    private function generate_qr_zip_response($ids) {
         if (!class_exists('ZipArchive')) {
             wp_die('ZipArchive is not available on this server.', 500);
         }
