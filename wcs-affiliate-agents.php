@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WCS Affiliate Agents
  * Description: Affiliate agent management for WooCommerce. Tracks sales per agent via short URLs like https://example.com/?UID, calculates commissions, provides an affiliate dashboard, and lets admin download QR codes and export payouts.
-* Version: 0.1.6
+* Version: 0.1.7
  * Author: ChatGPT
  * Requires PHP: 7.4
  */
@@ -50,6 +50,7 @@ class WCS_Affiliate_Agents {
         add_action('admin_menu', [$this, 'admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
         add_action('admin_init', [$this, 'handle_admin_actions']);
+        add_action('admin_init', [$this, 'maybe_update_schema']);
 
         // AJAX: download QR
         add_action('wp_ajax_wcs_download_affiliate_qr', [$this, 'ajax_download_affiliate_qr']);
@@ -370,7 +371,7 @@ public function attach_order_affiliate($order, $data) {
                 'paid_at'            => null,
             ],
             [
-                '%d','%s','%d','%f','%f','%f','%f','%s','%s','%s','%s',
+                '%d','%s','%d','%f','%f','%f','%f','%s','%s','%s','%s','%s',
             ]
         );
     }
@@ -398,7 +399,7 @@ public function attach_order_affiliate($order, $data) {
         global $wpdb;
         $order_id = (int) $order->get_id();
 
-        // Void unpaid commissions (pending/exported). Paid requires manual handling.
+        // Void unpaid commissions (pending/exported).
         $unpaid_ids = $wpdb->get_col(
             $wpdb->prepare(
                 "SELECT id FROM {$this->commissions_table}
@@ -424,19 +425,85 @@ public function attach_order_affiliate($order, $data) {
             );
         }
 
-        $paid_count = (int) $wpdb->get_var(
+        // Handle paid commissions: create a negative adjustment
+        $paid_commissions = $wpdb->get_results(
             $wpdb->prepare(
-                "SELECT COUNT(1) FROM {$this->commissions_table}
+                "SELECT * FROM {$this->commissions_table}
                  WHERE order_id = %d AND status = 'paid'",
                 $order_id
-            )
+            ),
+            ARRAY_A
         );
 
-        if ($paid_count > 0) {
-            $order->add_order_note(
-                __('Affiliate commission was already marked as paid for this order. Manual reversal may be required.', 'wcs-affiliates'),
-                false
-            );
+        if (!empty($paid_commissions)) {
+            foreach ($paid_commissions as $comm) {
+                // Check if negative adjustment already exists
+                $existing_adj = $wpdb->get_var(
+                    $wpdb->prepare(
+                        "SELECT id FROM {$this->commissions_table}
+                         WHERE order_id = %d AND commission_amount < 0 AND affiliate_id = %d",
+                        $order_id,
+                        (int) $comm['affiliate_id']
+                    )
+                );
+
+                if (!$existing_adj) {
+                    $refund_amount = -1 * abs((float)$comm['commission_amount']);
+                    $now = current_time('mysql');
+
+                    $wpdb->insert($this->commissions_table,
+                        [
+                            'affiliate_id'       => $comm['affiliate_id'],
+                            'uid'                => $comm['uid'],
+                            'order_id'           => $comm['order_id'],
+                            'order_total'        => (float) $comm['order_total'],
+                            'commission_base'    => (float) $comm['commission_base'],
+                            'commission_percent' => (float) $comm['commission_percent'],
+                            'commission_amount'  => $refund_amount,
+                            'currency'           => $comm['currency'],
+                            'status'             => 'pending',
+                            'batch_id'           => null,
+                            'created_at'         => $now,
+                            'paid_at'            => null,
+                        ],
+                        [
+                            '%d','%s','%d','%f','%f','%f','%f','%s','%s','%s','%s','%s',
+                        ]
+                    );
+
+                    $order->add_order_note(
+                        sprintf(
+                            __('Affiliate commission refund adjustment created for affiliate %s. Amount: %s', 'wcs-affiliates'),
+                            $comm['uid'],
+                            $refund_amount
+                        ),
+                        false
+                    );
+                }
+            }
+        }
+    }
+
+    public function maybe_update_schema() {
+        if (!current_user_can('manage_woocommerce')) {
+            return;
+        }
+        $db_version = get_option('wcs_affiliate_agents_db_version', '1.0');
+        if (version_compare($db_version, '1.1', '<')) {
+            global $wpdb;
+            $table = $this->commissions_table;
+
+            // Check if index exists
+            $indices = $wpdb->get_results("SHOW INDEX FROM {$table} WHERE Key_name = 'order_aff'");
+            if (!empty($indices)) {
+                $wpdb->query("ALTER TABLE {$table} DROP INDEX order_aff");
+                // Add a regular index on order_id for performance if not exists
+                $order_idx = $wpdb->get_results("SHOW INDEX FROM {$table} WHERE Key_name = 'order_id'");
+                if (empty($order_idx)) {
+                     $wpdb->query("ALTER TABLE {$table} ADD INDEX order_id (order_id)");
+                }
+            }
+            update_option('wcs_affiliate_agents_db_version', '1.1');
         }
     }
 
@@ -482,9 +549,30 @@ public function admin_menu() {
         if ($action === 'delete_agent') {
             $this->handle_delete_agent();
         }
-        if ($action === 'clear_commissions') {
-            $this->handle_clear_commissions();
+        if ($action === 'deactivate_agent') {
+            $this->handle_deactivate_agent();
         }
+        if ($action === 'void_unpaid') {
+            $this->handle_void_unpaid();
+        }
+        // Maintain legacy action for backward compatibility if any links exist
+        if ($action === 'clear_commissions') {
+            $this->handle_void_unpaid();
+        }
+    }
+
+    private function handle_deactivate_agent() {
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die('Unauthorized', 403);
+        }
+        $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+        check_admin_referer('wcs_aff_deactivate_' . $id);
+
+        global $wpdb;
+        $wpdb->update($this->affiliates_table, ['status' => 'inactive'], ['id' => $id]);
+
+        wp_redirect(add_query_arg(['page' => 'wcs_affiliates', 'msg' => 'deactivated'], admin_url('admin.php')));
+        exit;
     }
 
     private function handle_delete_agent() {
@@ -504,29 +592,26 @@ public function admin_menu() {
         exit;
     }
 
-    private function handle_clear_commissions() {
+    private function handle_void_unpaid() {
         if (!current_user_can('manage_woocommerce')) {
             wp_die('Unauthorized', 403);
         }
         $id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
-        check_admin_referer('wcs_aff_clear_' . $id);
+        // Check for either new or legacy nonce
+        if (!wp_verify_nonce($_REQUEST['_wpnonce'] ?? '', 'wcs_aff_void_' . $id) && !wp_verify_nonce($_REQUEST['_wpnonce'] ?? '', 'wcs_aff_clear_' . $id)) {
+            wp_die('Invalid nonce', 403);
+        }
 
         global $wpdb;
-        $wpdb->delete($this->commissions_table, ['affiliate_id' => $id], ['%d']);
+        // Void pending and exported commissions, preserve paid
+        $wpdb->query($wpdb->prepare(
+            "UPDATE {$this->commissions_table} SET status = 'void' WHERE affiliate_id = %d AND status IN ('pending', 'exported')",
+            $id
+        ));
 
-        // Redirect back to edit page or list page?
-        // User asked for option on Edit and List page.
-        // If referred from list, go to list. If from edit, go to edit.
-        // For simplicity, let's assume we redirect to edit page if we are "clearing",
-        // or we can just redirect to list if the parameter isn't present.
-        // Actually, let's redirect to the list if the action came from there?
-        // But commonly, "Clear Commissions" keeps the agent, so staying on the edit page (if that's where we were) is nice.
-        // I'll check wp_get_referer() or just redirect to the list with a message for now to be safe and consistent.
-        // OR better: check if we have a 'from' arg or just default to list.
-
-        $redirect = add_query_arg(['page' => 'wcs_affiliates', 'msg' => 'cleared'], admin_url('admin.php'));
+        $redirect = add_query_arg(['page' => 'wcs_affiliates', 'msg' => 'voided'], admin_url('admin.php'));
         if (isset($_GET['ref']) && $_GET['ref'] === 'edit') {
-             $redirect = add_query_arg(['page' => 'wcs_affiliates', 'action' => 'edit', 'id' => $id, 'msg' => 'cleared'], admin_url('admin.php'));
+             $redirect = add_query_arg(['page' => 'wcs_affiliates', 'action' => 'edit', 'id' => $id, 'msg' => 'voided'], admin_url('admin.php'));
         }
 
         wp_redirect($redirect);
@@ -791,7 +876,11 @@ public function admin_menu() {
             $m = sanitize_key($_GET['msg']);
             if ($m === 'deleted') {
                 echo '<div class="notice notice-success"><p>' . esc_html__('Affiliate deleted.', 'wcs-affiliates') . '</p></div>';
-            } elseif ($m === 'cleared') {
+            } elseif ($m === 'deactivated') {
+                echo '<div class="notice notice-success"><p>' . esc_html__('Affiliate deactivated.', 'wcs-affiliates') . '</p></div>';
+            } elseif ($m === 'voided') {
+                echo '<div class="notice notice-success"><p>' . esc_html__('Pending/Unpaid commissions voided. Paid history preserved.', 'wcs-affiliates') . '</p></div>';
+            } elseif ($m === 'cleared') { // Legacy
                 echo '<div class="notice notice-success"><p>' . esc_html__('Commissions cleared.', 'wcs-affiliates') . '</p></div>';
             }
         }
@@ -859,28 +948,65 @@ public function admin_menu() {
 
 
 
-        $rows = $wpdb->get_results("SELECT * FROM {$this->affiliates_table} ORDER BY created_at DESC", ARRAY_A);
+        // Search & Pagination
+        $search = isset($_REQUEST['s']) ? sanitize_text_field($_REQUEST['s']) : '';
+        $paged = isset($_REQUEST['paged']) ? max(1, (int) $_REQUEST['paged']) : 1;
+        $per_page = 50;
+        $offset = ($paged - 1) * $per_page;
 
+        $where = "1=1";
+        $args = [];
+        if ($search) {
+            $where .= " AND (name LIKE %s OR email LIKE %s OR uid LIKE %s)";
+            $like = '%' . $wpdb->esc_like($search) . '%';
+            $args[] = $like;
+            $args[] = $like;
+            $args[] = $like;
+        }
+
+        // Count total
+        if (!empty($args)) {
+            $count_sql = $wpdb->prepare("SELECT COUNT(*) FROM {$this->affiliates_table} WHERE $where", ...$args);
+        } else {
+            $count_sql = "SELECT COUNT(*) FROM {$this->affiliates_table} WHERE $where";
+        }
+        $total_items = (int) $wpdb->get_var($count_sql);
+        $total_pages = ceil($total_items / $per_page);
+
+        // Fetch Data
+        $query = "SELECT * FROM {$this->affiliates_table} WHERE $where ORDER BY created_at DESC LIMIT %d, %d";
+        $args[] = $offset;
+        $args[] = $per_page;
+        $rows = $wpdb->get_results($wpdb->prepare($query, ...$args), ARRAY_A);
+
+        // Fetch Commission Totals (for visible rows only)
         $totals = [];
-        $comm_rows = $wpdb->get_results(
-            "SELECT affiliate_id, 
-                    SUM(CASE WHEN status = 'pending' THEN commission_amount ELSE 0 END) AS unexported,
-                    SUM(CASE WHEN status = 'exported' THEN commission_amount ELSE 0 END) AS exported,
-                    SUM(CASE WHEN status IN ('pending','exported') THEN commission_amount ELSE 0 END) AS unpaid,
-                    SUM(CASE WHEN status != 'void' THEN commission_amount ELSE 0 END) AS total,
-                    MIN(currency) AS currency
-             FROM {$this->commissions_table}
-             GROUP BY affiliate_id",
-            ARRAY_A
-        );
-        foreach ($comm_rows as $r) {
-            $totals[(int) $r['affiliate_id']] = [
-                'unexported' => (float) $r['unexported'],
-                'exported'   => (float) $r['exported'],
-                'unpaid'     => (float) $r['unpaid'],
-                'total'      => (float) $r['total'],
-                'currency'   => (string) $r['currency'],
-            ];
+        if (!empty($rows)) {
+            $ids = wp_list_pluck($rows, 'id');
+            $id_str = implode(',', array_map('intval', $ids));
+            if ($id_str) {
+                $comm_rows = $wpdb->get_results(
+                    "SELECT affiliate_id,
+                            SUM(CASE WHEN status = 'pending' THEN commission_amount ELSE 0 END) AS unexported,
+                            SUM(CASE WHEN status = 'exported' THEN commission_amount ELSE 0 END) AS exported,
+                            SUM(CASE WHEN status IN ('pending','exported') THEN commission_amount ELSE 0 END) AS unpaid,
+                            SUM(CASE WHEN status != 'void' THEN commission_amount ELSE 0 END) AS total,
+                            MIN(currency) AS currency
+                     FROM {$this->commissions_table}
+                     WHERE affiliate_id IN ($id_str)
+                     GROUP BY affiliate_id",
+                    ARRAY_A
+                );
+                foreach ($comm_rows as $r) {
+                    $totals[(int) $r['affiliate_id']] = [
+                        'unexported' => (float) $r['unexported'],
+                        'exported'   => (float) $r['exported'],
+                        'unpaid'     => (float) $r['unpaid'],
+                        'total'      => (float) $r['total'],
+                        'currency'   => (string) $r['currency'],
+                    ];
+                }
+            }
         }
 
         // Global rollups for "unexported" (pending) summary
@@ -956,6 +1082,14 @@ $export_url = wp_nonce_url(
                     <div class="wcs-aff-summary__meta"><?php esc_html_e('Unexported + exported', 'wcs-affiliates'); ?></div>
                 </div>
             </div>
+            <!-- Search Box -->
+            <form method="get" style="float:right; margin-bottom:10px;">
+                <input type="hidden" name="page" value="wcs_affiliates" />
+                <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="<?php esc_attr_e('Search agent...', 'wcs-affiliates'); ?>" />
+                <button type="submit" class="button"><?php esc_html_e('Search', 'wcs-affiliates'); ?></button>
+            </form>
+            <div style="clear:both;"></div>
+
             <form method="post" style="margin:12px 0;">
                 <?php wp_nonce_field('wcs_aff_bulk_generate'); ?>
                 <input type="hidden" name="wcs_bulk_generate" value="1" />
@@ -1055,16 +1189,50 @@ $export_url = wp_nonce_url(
                             <td><a href="<?php echo esc_url($qr_url); ?>" class="button button-small"><?php esc_html_e('Download QR', 'wcs-affiliates'); ?></a></td>
                             <td>
                                 <a href="<?php echo esc_url($edit_url); ?>"><?php esc_html_e('Edit', 'wcs-affiliates'); ?></a>
-                                | <a href="#" onclick="wcs_confirm_delete('<?php echo esc_js($clear_url); ?>', '<?php echo esc_js(__('Clear all commissions for this agent?', 'wcs-affiliates')); ?>'); return false;" style="color:orange;"><?php esc_html_e('Clear', 'wcs-affiliates'); ?></a>
-                                | <a href="#" onclick="wcs_confirm_delete('<?php echo esc_js($delete_url); ?>', '<?php echo esc_js(__('Delete this agent completely?', 'wcs-affiliates')); ?>'); return false;" style="color:red;"><?php esc_html_e('Delete', 'wcs-affiliates'); ?></a>
+                                <?php
+                                $void_url = wp_nonce_url(
+                                    add_query_arg(['page' => 'wcs_affiliates', 'action' => 'void_unpaid', 'id' => $aff_id], admin_url('admin.php')),
+                                    'wcs_aff_void_' . $aff_id
+                                );
+                                $deactivate_url = wp_nonce_url(
+                                    add_query_arg(['page' => 'wcs_affiliates', 'action' => 'deactivate_agent', 'id' => $aff_id], admin_url('admin.php')),
+                                    'wcs_aff_deactivate_' . $aff_id
+                                );
+                                ?>
+                                | <a href="#" onclick="wcs_confirm_action('<?php echo esc_js($void_url); ?>', '<?php echo esc_js(__('Void (clear) all UNPAID commissions? Paid history will be kept.', 'wcs-affiliates')); ?>'); return false;" style="color:orange;"><?php esc_html_e('Void Unpaid', 'wcs-affiliates'); ?></a>
+                                <?php if ($row['status'] === 'active') : ?>
+                                    | <a href="#" onclick="wcs_confirm_action('<?php echo esc_js($deactivate_url); ?>', '<?php echo esc_js(__('Deactivate this agent?', 'wcs-affiliates')); ?>'); return false;" style="color:#d63638;"><?php esc_html_e('Deactivate', 'wcs-affiliates'); ?></a>
+                                <?php else : ?>
+                                    | <a href="#" onclick="wcs_confirm_delete('<?php echo esc_js($delete_url); ?>', '<?php echo esc_js(__('Permanently DELETE this agent and all data?', 'wcs-affiliates')); ?>'); return false;" style="color:red; font-weight:bold;"><?php esc_html_e('Delete Permanent', 'wcs-affiliates'); ?></a>
+                                <?php endif; ?>
                             </td>
                         </tr>
                     <?php endforeach; ?>
                 <?php endif; ?>
                 </tbody>
             </table>
+            <?php
+            // Pagination
+            if ($total_pages > 1) {
+                echo '<div class="tablenav bottom"><div class="tablenav-pages">';
+                echo paginate_links([
+                    'base' => add_query_arg('paged', '%#%'),
+                    'format' => '',
+                    'prev_text' => '&laquo;',
+                    'next_text' => '&raquo;',
+                    'total' => $total_pages,
+                    'current' => $paged
+                ]);
+                echo '</div></div>';
+            }
+            ?>
             </form>
             <script>
+            function wcs_confirm_action(url, msg) {
+                if (confirm(msg)) {
+                    window.location.href = url;
+                }
+            }
             function wcs_confirm_delete(url, msg) {
                 var check = prompt(msg + "\n<?php echo esc_js(__('Type "delete" to confirm:', 'wcs-affiliates')); ?>");
                 if (check === 'delete') {
@@ -1227,7 +1395,8 @@ $export_url = wp_nonce_url(
 
         $qr_url = '';
         $delete_url = '';
-        $clear_url = '';
+        $deactivate_url = '';
+        $void_url = '';
         if (!$is_new && !empty($row['id'])) {
             $qr_url = wp_nonce_url(
                 add_query_arg(
@@ -1243,12 +1412,19 @@ $export_url = wp_nonce_url(
                 ),
                 'wcs_aff_delete_' . (int) $row['id']
             );
-            $clear_url = wp_nonce_url(
+            $deactivate_url = wp_nonce_url(
                 add_query_arg(
-                    ['page' => 'wcs_affiliates', 'action' => 'clear_commissions', 'id' => (int) $row['id'], 'ref' => 'edit'],
+                    ['page' => 'wcs_affiliates', 'action' => 'deactivate_agent', 'id' => (int) $row['id']],
                     admin_url('admin.php')
                 ),
-                'wcs_aff_clear_' . (int) $row['id']
+                'wcs_aff_deactivate_' . (int) $row['id']
+            );
+            $void_url = wp_nonce_url(
+                add_query_arg(
+                    ['page' => 'wcs_affiliates', 'action' => 'void_unpaid', 'id' => (int) $row['id'], 'ref' => 'edit'],
+                    admin_url('admin.php')
+                ),
+                'wcs_aff_void_' . (int) $row['id']
             );
         }
         ?>
@@ -1345,14 +1521,24 @@ $export_url = wp_nonce_url(
                 </p>
             </form>
 
-            <?php if (!$is_new && $delete_url) : ?>
+            <?php if (!$is_new && $void_url) : ?>
             <hr style="margin: 30px 0;">
-            <h2><?php esc_html_e('Danger Zone', 'wcs-affiliates'); ?></h2>
+            <h2><?php esc_html_e('Actions', 'wcs-affiliates'); ?></h2>
             <p>
-                <button type="button" class="button" onclick="wcs_confirm_delete('<?php echo esc_js($clear_url); ?>', '<?php echo esc_js(__('Clear all commissions for this agent? Agent will remain.', 'wcs-affiliates')); ?>')" style="color:orange; border-color:orange;"><?php esc_html_e('Clear Commissions', 'wcs-affiliates'); ?></button>
-                <button type="button" class="button" onclick="wcs_confirm_delete('<?php echo esc_js($delete_url); ?>', '<?php echo esc_js(__('Delete this agent completely? All data will be lost.', 'wcs-affiliates')); ?>')" style="color:red; border-color:red; margin-left:10px;"><?php esc_html_e('Delete Agent', 'wcs-affiliates'); ?></button>
+                <button type="button" class="button" onclick="wcs_confirm_action('<?php echo esc_js($void_url); ?>', '<?php echo esc_js(__('Void (clear) all UNPAID commissions? Paid history will be kept.', 'wcs-affiliates')); ?>')" style="color:orange; border-color:orange;"><?php esc_html_e('Void Unpaid Commissions', 'wcs-affiliates'); ?></button>
+
+                <?php if ($status_val === 'active') : ?>
+                    <button type="button" class="button" onclick="wcs_confirm_action('<?php echo esc_js($deactivate_url); ?>', '<?php echo esc_js(__('Deactivate this agent? They will not track new sales.', 'wcs-affiliates')); ?>')" style="color:#d63638; border-color:#d63638; margin-left:10px;"><?php esc_html_e('Deactivate Agent', 'wcs-affiliates'); ?></button>
+                <?php else : ?>
+                    <button type="button" class="button" onclick="wcs_confirm_delete('<?php echo esc_js($delete_url); ?>', '<?php echo esc_js(__('Permanently DELETE this agent and all data? This cannot be undone.', 'wcs-affiliates')); ?>')" style="color:red; border-color:red; margin-left:10px;"><?php esc_html_e('Delete Permanently', 'wcs-affiliates'); ?></button>
+                <?php endif; ?>
             </p>
             <script>
+            function wcs_confirm_action(url, msg) {
+                if (confirm(msg)) {
+                    window.location.href = url;
+                }
+            }
             function wcs_confirm_delete(url, msg) {
                 var check = prompt(msg + "\n<?php echo esc_js(__('Type "delete" to confirm:', 'wcs-affiliates')); ?>");
                 if (check === 'delete') {
@@ -1434,24 +1620,23 @@ $export_url = wp_nonce_url(
 
         global $wpdb;
 
+        // Filter out negative/zero balances by grouping by affiliate & currency
         $sql = "SELECT c.affiliate_id,
                        SUM(c.commission_amount) AS total_commission,
-                       MIN(c.currency) AS currency
+                       c.currency
                 FROM {$this->commissions_table} c
                 WHERE c.status = 'pending'
-                GROUP BY c.affiliate_id";
+                GROUP BY c.affiliate_id, c.currency
+                HAVING total_commission > 0";
         $rows = $wpdb->get_results($sql, ARRAY_A);
 
-        $pending_ids = $wpdb->get_col("SELECT id FROM {$this->commissions_table} WHERE status = 'pending'");
-        $pending_ids = array_values(array_filter(array_map('intval', (array) $pending_ids)));
-
         if (empty($rows)) {
-            wp_die(__('No pending commissions to export.', 'wcs-affiliates'));
+            wp_die(__('No pending commissions to export (only negative/zero balances found).', 'wcs-affiliates'));
         }
 
         $ids = array_map('intval', wp_list_pluck($rows, 'affiliate_id'));
-        $ids = array_filter($ids);
-        $ids = array_unique($ids);
+        $ids = array_values(array_unique(array_filter($ids)));
+
         if (empty($ids)) {
             wp_die(__('No pending commissions to export.', 'wcs-affiliates'));
         }
@@ -1485,6 +1670,10 @@ $export_url = wp_nonce_url(
             'currency',
         ]);
 
+        // Keep track of which commissions we are effectively exporting to update their status later
+        // We only want to update commissions for the (affiliate, currency) pairs that are being exported.
+        $exported_pairs = [];
+
         foreach ($rows as $r) {
             $aid = (int) $r['affiliate_id'];
             if (empty($aff_by_id[$aid])) {
@@ -1503,19 +1692,41 @@ $export_url = wp_nonce_url(
                 number_format((float) $r['total_commission'], 2, '.', ''),
                 $r['currency'],
             ]);
+            $exported_pairs[] = [
+                'affiliate_id' => $aid,
+                'currency'     => $r['currency']
+            ];
         }
         fclose($out);
 
         $batch_id = 'batch-' . gmdate('Ymd-His');
 
-        if (!empty($pending_ids)) {
-            foreach (array_chunk($pending_ids, 500) as $chunk) {
-                $placeholders = implode(',', array_fill(0, count($chunk), '%d'));
-                $sql_update = "UPDATE {$this->commissions_table}
-                               SET status = 'exported', batch_id = %s
-                               WHERE id IN ($placeholders)";
-                $args = array_merge([$batch_id], $chunk);
-                $wpdb->query($wpdb->prepare($sql_update, ...$args));
+        // Update status for pending commissions that belong to the exported groups
+        if (!empty($exported_pairs)) {
+            // Because we can have multiple pairs, we might need multiple updates or a complex WHERE.
+            // Simplest safe way: select IDs first.
+
+            // Build WHERE clause
+            $where_parts = [];
+            foreach ($exported_pairs as $pair) {
+                $where_parts[] = $wpdb->prepare("(affiliate_id = %d AND currency = %s)", $pair['affiliate_id'], $pair['currency']);
+            }
+            $where_sql = implode(' OR ', $where_parts);
+
+            $pending_ids_to_update = $wpdb->get_col(
+                "SELECT id FROM {$this->commissions_table}
+                 WHERE status = 'pending' AND ($where_sql)"
+            );
+
+            if (!empty($pending_ids_to_update)) {
+                foreach (array_chunk($pending_ids_to_update, 500) as $chunk) {
+                    $placeholders = implode(',', array_fill(0, count($chunk), '%d'));
+                    $sql_update = "UPDATE {$this->commissions_table}
+                                   SET status = 'exported', batch_id = %s
+                                   WHERE id IN ($placeholders)";
+                    $args = array_merge([$batch_id], $chunk);
+                    $wpdb->query($wpdb->prepare($sql_update, ...$args));
+                }
             }
         }
 
@@ -1523,16 +1734,33 @@ $export_url = wp_nonce_url(
     }
 
     public function ajax_download_affiliate_qr() {
-        if (!current_user_can('manage_woocommerce')) {
-            wp_die('Unauthorized', 403);
-        }
         $aff_id = isset($_GET['affiliate_id']) ? (int) $_GET['affiliate_id'] : 0;
         if ($aff_id <= 0) {
             wp_die('Invalid affiliate ID', 400);
         }
-        check_admin_referer('wcs_download_affiliate_qr_' . $aff_id);
 
         global $wpdb;
+
+        // Permission check: Admin or the Affiliate themselves
+        $is_admin = current_user_can('manage_woocommerce');
+        $is_owner = false;
+
+        if (!$is_admin && is_user_logged_in()) {
+            $user_id = get_current_user_id();
+            $owner_id = $wpdb->get_var($wpdb->prepare("SELECT user_id FROM {$this->affiliates_table} WHERE id = %d", $aff_id));
+            if ($owner_id && (int)$owner_id === $user_id) {
+                $is_owner = true;
+            }
+        }
+
+        if (!$is_admin && !$is_owner) {
+            wp_die('Unauthorized', 403);
+        }
+
+        // Verify nonce
+        if (!wp_verify_nonce($_REQUEST['_wpnonce'] ?? '', 'wcs_download_affiliate_qr_' . $aff_id)) {
+            wp_die('Invalid nonce', 403);
+        }
         $row = $wpdb->get_row(
             $wpdb->prepare("SELECT * FROM {$this->affiliates_table} WHERE id = %d LIMIT 1", $aff_id),
             ARRAY_A
@@ -1726,6 +1954,14 @@ $export_url = wp_nonce_url(
         $uid = $aff['uid'];
         $ref_url = $this->build_referral_url($uid);
 
+        $qr_url = wp_nonce_url(
+            add_query_arg(
+                ['action' => 'wcs_download_affiliate_qr', 'affiliate_id' => (int) $aff['id']],
+                admin_url('admin-ajax.php')
+            ),
+            'wcs_download_affiliate_qr_' . (int) $aff['id']
+        );
+
         ob_start();
         ?>
         <div class="wcs-aff-dashboard wcs-aff-dashboard-<?php echo esc_attr($mode); ?>">
@@ -1733,9 +1969,23 @@ $export_url = wp_nonce_url(
             <p><strong><?php echo esc_html($aff['name']); ?></strong> (<?php echo esc_html($aff['email']); ?>)</p>
 
             <h3><?php esc_html_e('Your referral link', 'wcs-affiliates'); ?></h3>
-            <p>
-                <input type="text" readonly value="<?php echo esc_attr($ref_url); ?>" style="width:100%; max-width:480px;" onclick="this.select();" />
-            </p>
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:15px;">
+                <input type="text" id="wcs_aff_ref_url_<?php echo (int)$aff['id']; ?>" readonly value="<?php echo esc_attr($ref_url); ?>" style="flex:1; min-width:250px; padding:8px;" onclick="this.select();" />
+                <button type="button" class="button" onclick="wcs_aff_copy_link_<?php echo (int)$aff['id']; ?>()"><?php esc_html_e('Copy', 'wcs-affiliates'); ?></button>
+                <a href="<?php echo esc_url($qr_url); ?>" class="button"><?php esc_html_e('Download QR', 'wcs-affiliates'); ?></a>
+            </div>
+            <script>
+            function wcs_aff_copy_link_<?php echo (int)$aff['id']; ?>() {
+                var copyText = document.getElementById("wcs_aff_ref_url_<?php echo (int)$aff['id']; ?>");
+                copyText.select();
+                copyText.setSelectionRange(0, 99999);
+                navigator.clipboard.writeText(copyText.value).then(function() {
+                    alert("<?php echo esc_js(__('Copied to clipboard!', 'wcs-affiliates')); ?>");
+                }, function(err) {
+                    console.error('Async: Could not copy text: ', err);
+                });
+            }
+            </script>
 
             <h3><?php esc_html_e('Earnings overview', 'wcs-affiliates'); ?></h3>
             <ul>
