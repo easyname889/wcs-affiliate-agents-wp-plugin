@@ -1464,6 +1464,7 @@ $export_url = wp_nonce_url(
 
             <form method="post">
                 <?php wp_nonce_field('wcs_aff_edit'); ?>
+                <input type="hidden" name="wcs_aff_save" value="1" />
                 <table class="form-table" role="presentation">
                     <tr>
                         <th scope="row"><label for="wcs_aff_name"><?php esc_html_e('Name', 'wcs-affiliates'); ?></label></th>
@@ -1547,7 +1548,7 @@ $export_url = wp_nonce_url(
                 </table>
 
                 <p class="submit">
-                    <button type="submit" name="wcs_aff_save" class="button button-primary"><?php esc_html_e('Save Affiliate', 'wcs-affiliates'); ?></button>
+                    <button type="submit" class="button button-primary"><?php esc_html_e('Save Affiliate', 'wcs-affiliates'); ?></button>
                 </p>
             </form>
 
