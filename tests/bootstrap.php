@@ -122,8 +122,13 @@ class MockWPDB {
     public $tables = []; // 'table_name' => [rows]
     public $mock_get_row_result = null;
     public $mock_get_var_result = null;
+    public $mock_get_col_result = null;
+    public $mock_get_results_result = null;
+
+    public $queries = [];
 
     public function prepare($query, ...$args) {
+        // Simple replace for common placeholders
         foreach ($args as $arg) {
             $query = preg_replace('/%[sdf]/', "'$arg'", $query, 1);
         }
@@ -131,6 +136,7 @@ class MockWPDB {
     }
 
     public function get_row($query, $output_type = OBJECT) {
+        $this->queries[] = $query;
         if ($this->mock_get_row_result !== null) {
             return $this->mock_get_row_result;
         }
@@ -138,6 +144,7 @@ class MockWPDB {
     }
 
     public function get_var($query) {
+        $this->queries[] = $query;
         if ($this->mock_get_var_result !== null) {
             return $this->mock_get_var_result;
         }
@@ -145,10 +152,20 @@ class MockWPDB {
     }
 
     public function get_col($query) {
+        $this->queries[] = $query;
+        if ($this->mock_get_col_result !== null) {
+            return $this->mock_get_col_result;
+        }
         return [];
     }
 
+    public function query($query) {
+        $this->queries[] = $query;
+        return true;
+    }
+
     public function insert($table, $data, $format = null) {
+        $this->queries[] = "INSERT INTO $table ...";
         if (!isset($this->tables[$table])) {
             $this->tables[$table] = [];
         }
@@ -159,20 +176,77 @@ class MockWPDB {
     }
 
     public function update($table, $data, $where, $format = null, $where_format = null) {
+        $this->queries[] = "UPDATE $table ...";
+        // Simple in-memory update if possible
+        if (isset($this->tables[$table])) {
+            foreach ($this->tables[$table] as &$row) {
+                // Check if row matches 'where'
+                $match = true;
+                foreach ($where as $wk => $wv) {
+                    if (!isset($row[$wk]) || $row[$wk] != $wv) {
+                        $match = false;
+                        break;
+                    }
+                }
+                if ($match) {
+                    foreach ($data as $dk => $dv) {
+                        $row[$dk] = $dv;
+                    }
+                }
+            }
+        }
         return true;
     }
 
     public function get_results($query, $type = OBJECT) {
+        $this->queries[] = $query;
+        if ($this->mock_get_results_result !== null) {
+            return $this->mock_get_results_result;
+        }
         // Return contents of table if query matches select *
         // Very basic parsing
         if (preg_match("/SELECT \* FROM ([\w_]+)/", $query, $matches)) {
             $table = $matches[1];
-            return $this->tables[$table] ?? [];
+            $rows = $this->tables[$table] ?? [];
+
+            // Basic WHERE filtering
+            if (preg_match("/WHERE (.*)/", $query, $where_matches)) {
+                $where_clause = $where_matches[1];
+                // Simple parsing for AND conditions
+                $conditions = explode(' AND ', $where_clause);
+                $rows = array_filter($rows, function($row) use ($conditions) {
+                    foreach ($conditions as $cond) {
+                        // Handle order_id = 123
+                        if (preg_match("/([\w_]+)\s*=\s*(\d+)/", $cond, $m)) {
+                             if (($row[$m[1]] ?? '') != $m[2]) return false;
+                        }
+                        // Handle status = 'paid'
+                        elseif (preg_match("/([\w_]+)\s*=\s*'([^']+)'/", $cond, $m)) {
+                             if (($row[$m[1]] ?? '') != $m[2]) return false;
+                        }
+                        // Handle status IN ('pending','exported') - very crude
+                         elseif (preg_match("/([\w_]+)\s*IN\s*\(([^)]+)\)/", $cond, $m)) {
+                             $val = $row[$m[1]] ?? '';
+                             $options = array_map(function($s){ return trim($s, "' "); }, explode(',', $m[2]));
+                             if (!in_array($val, $options)) return false;
+                         }
+                    }
+                    return true;
+                });
+            }
+            return array_values($rows);
         }
         return [];
     }
 
+    public function delete($table, $where, $where_format = null) {
+         $this->queries[] = "DELETE FROM $table ...";
+         return true;
+    }
+
     public function get_charset_collate() { return ''; }
+
+    public function esc_like($text) { return $text; }
 }
 
 global $wpdb;
@@ -219,6 +293,10 @@ class WC_Order {
     public function add_order_note() {}
 }
 
+function wc_get_order($id) {
+    global $mock_orders;
+    return $mock_orders[$id] ?? false;
+}
 
 // Load plugin
 require_once __DIR__ . '/../wcs-affiliate-agents.php';
