@@ -112,7 +112,12 @@ function username_exists($user) { return false; }
 function wp_generate_password() { return 'mockpass'; }
 function wp_create_user($user, $pass, $email) { return 123; } // Mock ID
 function wp_update_user($args) {}
-function current_user_can($cap) { return true; }
+function current_user_can($cap) {
+    if ($cap === 'manage_woocommerce' && isset($GLOBALS['current_user_can_manage_woocommerce'])) {
+        return $GLOBALS['current_user_can_manage_woocommerce'];
+    }
+    return true;
+}
 
 // DB
 class MockWPDB {
