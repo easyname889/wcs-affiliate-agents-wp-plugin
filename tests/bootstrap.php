@@ -60,6 +60,7 @@ function sanitize_user($user) { return sanitize_key($user); }
 function esc_attr($s) { return htmlspecialchars($s, ENT_QUOTES); }
 function esc_html($s) { return htmlspecialchars($s, ENT_QUOTES); }
 function esc_html_e($s) { echo esc_html($s); }
+function esc_html__($s, $d = '') { return htmlspecialchars($s, ENT_QUOTES); }
 function esc_url($s) { return $s; }
 function esc_js($s) { return json_encode($s); }
 function __($s, $d) { return $s; }
