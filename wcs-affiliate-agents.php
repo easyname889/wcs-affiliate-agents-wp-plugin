@@ -1624,7 +1624,7 @@ $export_url = wp_nonce_url(
         $row = $row ?? []; // Ensure row is array-ish if null
 
         $uid = $row['uid'] ?? $this->generate_preview_uid();
-        $ref_url = $this->build_referral_url($uid);
+        $ref_url = $this->build_referral_url($uid, $row);
         $commission_percent = $row['commission_percent'] ?? $this->options['default_commission_percent'];
         $status_val = $row['status'] ?? 'active';
         $dashboard_mode_val = $row['dashboard_mode'] ?? 'default';

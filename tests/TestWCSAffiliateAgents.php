@@ -114,7 +114,3 @@ class TestWCSAffiliateAgents extends TestCase {
 }
 
 // Helper to inject mocks into WC_Order
-function wc_get_order($id) {
-    global $mock_orders;
-    return $mock_orders[$id] ?? false;
-}
