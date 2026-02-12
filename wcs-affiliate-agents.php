@@ -84,6 +84,9 @@ class WCS_Affiliate_Agents {
             bank_account_type VARCHAR(64) DEFAULT '' ,
             bank_account_number VARCHAR(191) DEFAULT '' ,
             commission_percent DECIMAL(6,2) NOT NULL DEFAULT 0.00,
+            utm_source VARCHAR(191) DEFAULT '',
+            utm_medium VARCHAR(191) DEFAULT '',
+            utm_campaign VARCHAR(191) DEFAULT '',
             dashboard_mode VARCHAR(16) NOT NULL DEFAULT 'default',
             status VARCHAR(16) NOT NULL DEFAULT 'active',
             created_at DATETIME NOT NULL,
@@ -184,7 +187,7 @@ private function build_affiliate_query_key($uid) {
     return $prefix . '-' . $uid;
 }
 
-    private function build_referral_url($uid) {
+    private function build_referral_url($uid, $affiliate = null) {
         $ref_key = $this->build_affiliate_query_key($uid);
         // Keep the UID as a query-key (no "=") to stay as short as possible.
         $url = home_url('/?' . rawurlencode($ref_key));
@@ -195,6 +198,19 @@ private function build_affiliate_query_key($uid) {
             $src = trim((string) ($o['utm_source'] ?? ''));
             $med = trim((string) ($o['utm_medium'] ?? ''));
             $cam = trim((string) ($o['utm_campaign'] ?? ''));
+
+            if ($affiliate && is_array($affiliate)) {
+                if (!empty($affiliate['utm_source'])) {
+                    $src = trim($affiliate['utm_source']);
+                }
+                if (!empty($affiliate['utm_medium'])) {
+                    $med = trim($affiliate['utm_medium']);
+                }
+                if (!empty($affiliate['utm_campaign'])) {
+                    $cam = trim($affiliate['utm_campaign']);
+                }
+            }
+
             if ($src !== '') { $utm['utm_source'] = $src; }
             if ($med !== '') { $utm['utm_medium'] = $med; }
             if ($cam !== '') { $utm['utm_campaign'] = $cam; }
@@ -669,6 +685,25 @@ public function attach_order_affiliate($order, $data) {
             }
             update_option('wcs_affiliate_agents_db_version', '1.1');
         }
+
+        if (version_compare($db_version, '1.2', '<')) {
+            global $wpdb;
+            $table = $this->affiliates_table;
+
+            $cols = $wpdb->get_results("SHOW COLUMNS FROM {$table} LIKE 'utm_source'");
+            if (empty($cols)) {
+                $wpdb->query("ALTER TABLE {$table} ADD COLUMN utm_source VARCHAR(191) DEFAULT '' AFTER commission_percent");
+            }
+            $cols = $wpdb->get_results("SHOW COLUMNS FROM {$table} LIKE 'utm_medium'");
+            if (empty($cols)) {
+                $wpdb->query("ALTER TABLE {$table} ADD COLUMN utm_medium VARCHAR(191) DEFAULT '' AFTER utm_source");
+            }
+            $cols = $wpdb->get_results("SHOW COLUMNS FROM {$table} LIKE 'utm_campaign'");
+            if (empty($cols)) {
+                $wpdb->query("ALTER TABLE {$table} ADD COLUMN utm_campaign VARCHAR(191) DEFAULT '' AFTER utm_medium");
+            }
+            update_option('wcs_affiliate_agents_db_version', '1.2');
+        }
     }
 
 public function admin_menu() {
@@ -803,6 +838,9 @@ public function admin_menu() {
         $bank_account_type = sanitize_text_field($_POST['bank_account_type'] ?? '');
         $bank_account_number = sanitize_text_field($_POST['bank_account_number'] ?? '');
         $commission = isset($_POST['commission_percent']) ? floatval($_POST['commission_percent']) : 0;
+        $utm_source = sanitize_text_field($_POST['utm_source'] ?? '');
+        $utm_medium = sanitize_text_field($_POST['utm_medium'] ?? '');
+        $utm_campaign = sanitize_text_field($_POST['utm_campaign'] ?? '');
         $status_input = $_POST['status'] ?? 'active';
         $status = in_array($status_input, ['active','inactive'], true) ? $status_input : 'active';
         $dashboard_mode = $_POST['dashboard_mode'] ?? 'default';
@@ -838,13 +876,16 @@ public function admin_menu() {
                     'bank_account_type'  => $bank_account_type,
                     'bank_account_number'=> $bank_account_number,
                     'commission_percent' => $commission,
+                    'utm_source'         => $utm_source,
+                    'utm_medium'         => $utm_medium,
+                    'utm_campaign'       => $utm_campaign,
                     'dashboard_mode'     => $dashboard_mode,
                     'status'             => $status,
                     'created_at'         => $now,
                     'updated_at'         => $now,
                 ],
                 [
-                    '%d','%s','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%s','%s',
+                    '%d','%s','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%s','%s','%s','%s','%s',
                 ]
             );
 
@@ -877,12 +918,15 @@ public function admin_menu() {
                     'bank_account_type'  => $bank_account_type,
                     'bank_account_number'=> $bank_account_number,
                     'commission_percent' => $commission,
+                    'utm_source'         => $utm_source,
+                    'utm_medium'         => $utm_medium,
+                    'utm_campaign'       => $utm_campaign,
                     'dashboard_mode'     => $dashboard_mode,
                     'status'             => $status,
                     'updated_at'         => $now,
                 ],
                 ['id' => $id],
-                ['%d','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%d'],
+                ['%d','%s','%s','%s','%s','%s','%s','%s','%f','%s','%s','%s','%s','%s','%s'],
                 ['%d']
             );
 
@@ -1664,6 +1708,29 @@ $export_url = wp_nonce_url(
                         </td>
                     </tr>
                     <tr>
+                        <th scope="row"><?php esc_html_e('UTM Source', 'wcs-affiliates'); ?></th>
+                        <td>
+                            <input name="utm_source" type="text" class="regular-text" value="<?php echo esc_attr($row['utm_source'] ?? ''); ?>" placeholder="<?php echo esc_attr($this->options['utm_source']); ?>" />
+                            <p class="description"><?php esc_html_e('Leave empty to use global default.', 'wcs-affiliates'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('UTM Medium', 'wcs-affiliates'); ?></th>
+                        <td>
+                            <input name="utm_medium" type="text" class="regular-text" value="<?php echo esc_attr($row['utm_medium'] ?? ''); ?>" placeholder="<?php echo esc_attr($this->options['utm_medium']); ?>" />
+                            <p class="description"><?php esc_html_e('Leave empty to use global default.', 'wcs-affiliates'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><?php esc_html_e('UTM Campaign', 'wcs-affiliates'); ?></th>
+                        <td>
+                            <input name="utm_campaign" type="text" class="regular-text" value="<?php echo esc_attr($row['utm_campaign'] ?? ''); ?>" placeholder="<?php echo esc_attr($this->options['utm_campaign']); ?>" />
+                            <p class="description"><?php esc_html_e('Leave empty to use global default.', 'wcs-affiliates'); ?>
+                            <br><strong style="color:#d63638;"><?php esc_html_e('Warning: Changing any UTM value requires you to re-print or use a new QR code.', 'wcs-affiliates'); ?></strong>
+                            </p>
+                        </td>
+                    </tr>
+                    <tr>
                         <th scope="row"><?php esc_html_e('Dashboard mode', 'wcs-affiliates'); ?></th>
                         <td>
                             <select name="dashboard_mode">
@@ -1963,7 +2030,7 @@ $export_url = wp_nonce_url(
         }
 
         $uid = $row['uid'];
-        $url = $this->build_referral_url($uid);
+        $url = $this->build_referral_url($uid, $row);
 
         $initials = $this->get_initials_from_name($row['name'], $uid);
         $filename = 'worldcitisim-affiliate-' . $uid . '-' . $initials . '.png';
@@ -2075,7 +2142,7 @@ $export_url = wp_nonce_url(
             }
 
             $uid = (string) $row['uid'];
-            $url = $this->build_referral_url($uid);
+            $url = $this->build_referral_url($uid, $row);
             $initials = $this->get_initials_from_name((string) $row['name'], $uid);
             $filename = 'worldcitisim-affiliate-' . $uid . '-' . $initials . '.png';
 
@@ -2187,7 +2254,7 @@ $export_url = wp_nonce_url(
         $total_earned = $sums && $sums['total_earned'] !== null ? (float) $sums['total_earned'] : 0;
 
         $uid = $aff['uid'];
-        $ref_url = $this->build_referral_url($uid);
+        $ref_url = $this->build_referral_url($uid, $aff);
 
         $qr_url = wp_nonce_url(
             add_query_arg(
