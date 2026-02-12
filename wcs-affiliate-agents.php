@@ -424,15 +424,29 @@ public function attach_order_affiliate($order, $data) {
             return;
         }
 
-        $refund_amount = (float) $refund->get_amount(); // This is typically positive in recent WC versions but check
+        // Calculate relevant totals based on commission base setting
+        $commission_base_mode = $this->options['commission_base'] ?? 'line_subtotal';
+        $refund_amount = (float) $refund->get_amount();
+        $order_total   = (float) $order->get_total();
+
+        // Adjust for shipping if excluded
+        if ($commission_base_mode === 'order_total_excl_shipping' || $commission_base_mode === 'line_subtotal') {
+            $refund_amount -= (float) $refund->get_shipping_total();
+            $refund_amount -= (float) $refund->get_shipping_tax();
+
+            $order_total   -= (float) $order->get_shipping_total();
+            $order_total   -= (float) $order->get_shipping_tax();
+        }
+
         if ($refund_amount < 0) {
              $refund_amount *= -1;
         }
-        if ($refund_amount <= 0) {
+
+        // If refund amount (net of shipping) is zero or less, no commission to deduct
+        if ($refund_amount <= 0.000001) {
             return;
         }
 
-        $order_total = (float) $order->get_total(); // Total paid by customer
         // Avoid division by zero
         if ($order_total <= 0) {
              $ratio = 1.0;
@@ -559,11 +573,12 @@ public function attach_order_affiliate($order, $data) {
         }
 
         // Simplified Logic:
-        // 1. Void all pending/exported (unpaid) positive commissions.
+        // 1. Void all pending/exported (unpaid) commissions (both positive AND negative).
+        // This ensures we don't leave a negative "refund adjustment" pending if we are voiding the original positive commission.
         $wpdb->query(
             $wpdb->prepare(
                 "UPDATE {$this->commissions_table} SET status = 'void'
-                 WHERE order_id = %d AND status IN ('pending','exported') AND commission_amount > 0",
+                 WHERE order_id = %d AND status IN ('pending','exported')",
                 $order_id
             )
         );

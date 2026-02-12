@@ -199,8 +199,11 @@ class TestRefunds extends TestCase {
         // We expect `net_balance` to be 5.00 (10 - 5).
         // First query returns net_balance = 5.00.
         // Second query (after potential void of pending) returns net_balance = 5.00 (since the -5 is pending but negative, we only void positive pending).
-        // Actually my code says: "WHERE ... AND status IN ('pending','exported') AND commission_amount > 0".
-        // So the -5.00 adjustment (status=pending) is NOT voided. Correct.
+        // Actually we updated logic to void ALL pending, so the -5.00 SHOULD be voided.
+        // This is safer to prevent double deduction.
+        // If we void +10 and -5, Net becomes 0.
+        // If we only void +10 (and keep -5), Net becomes -5. The agent is penalized.
+        // So we expect the query to NOT have "AND commission_amount > 0".
 
         // Since we can't easily mock sequential returns, we will manually test the logic by mocking the return
         // to say "Net balance is 5.00".
@@ -230,17 +233,85 @@ class TestRefunds extends TestCase {
         $found_insert = false;
         foreach ($wpdb->queries as $q) {
             if (strpos($q, "INSERT INTO {$comm_table}") !== false) {
-                 // We can't see values easily in the query string because prepared.
                  $found_insert = true;
             }
         }
-        // Also check table
-        // The table should have 3 rows now: +10, -5, and the new -5.
-        // But MockWPDB `insert` updates the table array.
-        // Wait, did `maybe_void_commissions` actually run insert?
-        // It iterates over `$rows_after`. We mocked `$rows_after` (by reusing the same mock result since we can't sequence).
-        // So yes, it sees 5.00 positive and inserts -5.00.
+        $this->assertTrue($found_insert, "Should have inserted a clearing adjustment if net balance was positive");
 
-        $this->assertTrue($found_insert, "Should have inserted a clearing adjustment");
+        // Also verify the UPDATE query did NOT restrict to positive amounts
+        $found_void_all = false;
+        foreach ($wpdb->queries as $q) {
+            // Looking for absence of "commission_amount > 0" in the specific UPDATE query
+            if (strpos($q, "UPDATE {$comm_table} SET status = 'void'") !== false) {
+                if (strpos($q, "commission_amount > 0") === false) {
+                    $found_void_all = true;
+                }
+            }
+        }
+        $this->assertTrue($found_void_all, "Should have voided ALL pending commissions (positive and negative)");
+    }
+
+    public function test_shipping_refund_exclusion() {
+        global $wpdb;
+        $plugin = WCS_Affiliate_Agents::instance();
+        // Force option: exclude shipping
+        // Reflection to access private options or re-instance?
+        // Since options are loaded in constructor, re-instancing might not help if instance is static.
+        // But get_options reads from DB or prop.
+        // Let's mock get_option globally since plugin uses $this->options which is set in constructor.
+        // BUT $this->options is a property.
+
+        // We can use Reflection to modify the property.
+        $ref = new ReflectionClass($plugin);
+        $prop = $ref->getProperty('options');
+        $prop->setAccessible(true);
+        $opts = $prop->getValue($plugin);
+        $opts['commission_base'] = 'order_total_excl_shipping';
+        $prop->setValue($plugin, $opts);
+
+        $order_id = 300;
+        $order = new class($order_id) extends WC_Order {
+             public function get_total() { return 110.00; } // 100 Item + 10 Shipping
+             public function get_shipping_total() { return 10.00; }
+             public function get_shipping_tax() { return 0.00; }
+        };
+        global $mock_orders;
+        $mock_orders[$order_id] = $order;
+
+        // Refund ID
+        $refund_id = 301;
+        $refund = new class($refund_id) extends WC_Order {
+             public function get_amount() { return 10.00; } // Refunded shipping amount
+             public function get_shipping_total() { return 10.00; } // Specifically refunding shipping
+             public function get_shipping_tax() { return 0.00; }
+        };
+        $mock_orders[$refund_id] = $refund;
+
+        // Setup Commission
+        $comm_table = $wpdb->prefix . 'wcs_affiliate_commissions';
+        $wpdb->insert($comm_table, [
+            'affiliate_id' => 1, 'uid' => 'AGENT1', 'order_id' => $order_id,
+            'order_total' => 110.00, 'commission_percent' => 10,
+            'commission_amount' => 10.00, 'status' => 'paid', 'currency' => 'USD', // Comm on 100 base
+            'created_at' => date('Y-m-d H:i:s'),
+        ]);
+
+        // Run
+        $wpdb->mock_get_results_result = null; // Use native table select
+        $plugin->handle_order_refund($order_id, $refund_id);
+
+        // Expectation:
+        // Refund Amount Net = 10.00 (Total) - 10.00 (Shipping) = 0.00.
+        // Ratio = 0.
+        // Deduction = 0.
+        // Should NOT insert a negative commission.
+
+        $inserted = false;
+        foreach ($wpdb->tables[$comm_table] as $row) {
+            if ($row['order_id'] == $order_id && $row['commission_amount'] < 0) {
+                $inserted = true;
+            }
+        }
+        $this->assertFalse($inserted, "Should NOT deduct commission when refunding excluded shipping cost");
     }
 }
